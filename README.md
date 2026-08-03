@@ -220,11 +220,14 @@ to `image_paths` for batch analysis.
 paste the system clipboard image. On macOS, this extension also maps
 `option+v` to that built-in action (the terminal must report Option as Alt).
 Pi reads the clipboard, writes the bytes to
-`/tmp/pi-clipboard-<uuid>.<ext>`, and inserts that path at the cursor. Our
-existing path-token pipeline detects it, renders a `[Image-#N]` marker, and
-attaches (multimodal) or delegates (text-only) — no separate clipboard code
-path needed. Multi-image clipboard = N `ctrl+v` presses = N paths = handled
-as a batch.
+`/tmp/pi-clipboard-<uuid>.<ext>`, and this extension immediately collapses
+that path to a theme-accented `[Image-#N]` marker in the editor. The color is
+render-only; submitted text remains plain. On submit, the marker expands back
+to the real path for loading, then the existing pipeline attaches (multimodal)
+or delegates (text-only). Multimodal conversations keep the temp path hidden;
+text-only `hint` mode still lists paths intentionally so `describe_image` can
+read them. Multi-image clipboard = N paste actions = N sequential markers =
+handled as a batch.
 
 ## Config + security (v0.5.0)
 

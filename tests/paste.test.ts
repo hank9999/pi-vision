@@ -1,9 +1,87 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  addComposeImageMarkersToEditor,
+  ComposeImageReferences,
   findImagePathTokens,
   remapMacOptionVPaste,
 } from "../extensions/paste.ts";
+
+test("addComposeImageMarkersToEditor: colors markers only in rendered output", () => {
+  let text = "compare [Image-#1] and [Image-#2]";
+  const editor = {
+    getText: () => text,
+    setText: (next: string) => { text = next; },
+    insertTextAtCursor: (inserted: string) => { text += inserted; },
+    handleInput: () => {},
+    render: () => [text],
+    invalidate: () => {},
+  };
+  const references = new ComposeImageReferences();
+  const wrapped = addComposeImageMarkersToEditor(
+    editor,
+    references,
+    (marker) => `<accent>${marker}</accent>`,
+  );
+
+  assert.deepEqual(
+    wrapped.render(80),
+    ["compare <accent>[Image-#1]</accent> and <accent>[Image-#2]</accent>"],
+  );
+  assert.equal(wrapped.getText(), "compare [Image-#1] and [Image-#2]");
+});
+
+test("ComposeImageReferences: replaces clipboard paths with visible image markers", () => {
+  const refs = new ComposeImageReferences();
+  const first = "/tmp/pi-clipboard-11111111-1111-4111-8111-111111111111.png";
+  const second = "/tmp/pi-clipboard-22222222-2222-4222-8222-222222222222.jpg";
+
+  assert.equal(refs.collapse(`compare ${first}`), "compare [Image-#1]");
+  assert.equal(refs.collapse(`compare [Image-#1] and ${second}`), "compare [Image-#1] and [Image-#2]");
+  assert.equal(
+    refs.expand("compare [Image-#1] and [Image-#2]"),
+    `compare ${first} and ${second}`,
+  );
+});
+
+test("ComposeImageReferences: ignores regular paths and avoids handwritten marker numbers", () => {
+  const refs = new ComposeImageReferences();
+  const clipboard = "/tmp/pi-clipboard-33333333-3333-4333-8333-333333333333.webp";
+
+  assert.equal(refs.collapse("see /tmp/regular.png"), "see /tmp/regular.png");
+  assert.equal(refs.collapse(`literal [Image-#1] ${clipboard}`), "literal [Image-#1] [Image-#2]");
+  refs.reset();
+  assert.equal(refs.collapse(clipboard), "[Image-#1]");
+});
+
+test("ComposeImageReferences: reuses numbering after the marker is deleted", () => {
+  const refs = new ComposeImageReferences();
+  const first = "/tmp/pi-clipboard-44444444-4444-4444-8444-444444444444.png";
+  const replacement = "/tmp/pi-clipboard-55555555-5555-4555-8555-555555555555.png";
+
+  assert.equal(refs.collapse(first), "[Image-#1]");
+  assert.equal(refs.collapse(""), "");
+  assert.equal(refs.collapse(replacement), "[Image-#1]");
+});
+
+test("ComposeImageReferences: collapses Windows clipboard paths passed by the editor", () => {
+  const refs = new ComposeImageReferences();
+  const clipboard = String.raw`C:\Users\pi\AppData\Local\Temp\pi-clipboard-66666666-6666-4666-8666-666666666666.png`;
+
+  assert.equal(refs.collapseInsertion(clipboard, ""), "[Image-#1]");
+  assert.equal(refs.expand("[Image-#1]"), clipboard);
+});
+
+test("ComposeImageReferences: restores unresolved expanded paths to their markers", () => {
+  const refs = new ComposeImageReferences();
+  const clipboard = "/tmp/pi-clipboard-88888888-8888-4888-8888-888888888888.png";
+  refs.collapseInsertion(clipboard, "");
+
+  assert.equal(
+    refs.restorePaths(`failed ${clipboard}`, (index) => `**[Image-#${index}]**`),
+    "failed **[Image-#1]**",
+  );
+});
 
 test("remapMacOptionVPaste: macOS Option+V forwards to pi's image-paste input", () => {
   assert.deepEqual(remapMacOptionVPaste("\x1bv", "darwin"), { data: "\x16" });
@@ -89,4 +167,9 @@ test("findImagePathTokens: escaped + regular paths mixed", () => {
   assert.equal(out.length, 2);
   assert.equal(out[0], "/tmp/a.png");
   assert.equal(out[1], "/tmp/My\\ B.jpeg");
+});
+
+test("findImagePathTokens: Windows clipboard path with spaces", () => {
+  const path = String.raw`C:\Users\Pi User\AppData\Local\Temp\pi-clipboard-77777777-7777-4777-8777-777777777777.png`;
+  assert.deepEqual(findImagePathTokens(`analyze ${path}`), [path]);
 });

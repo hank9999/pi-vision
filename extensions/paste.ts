@@ -27,33 +27,155 @@
  */
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve as resolvePath } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  CustomEditor,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey, type EditorComponent } from "@earendil-works/pi-tui";
 import { isMultimodal } from "../lib/capability.ts";
 import { loadImage } from "../lib/image.ts";
-import { renderMarkers, buildHintLine, buildDescriptionsBlock } from "../lib/marker.ts";
+import { renderMarkers, buildHintLine, buildDescriptionsBlock, styleMarker } from "../lib/marker.ts";
 import { getSharedConfig, getSharedCache } from "../lib/state.ts";
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import type { ReasoningLevel } from "../lib/config.ts";
 import { createComposePreviewComponent, makePreviewImage } from "../lib/preview.ts";
 import { mapWithConcurrency } from "../lib/batch.ts";
 
+type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
+
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const PI_DEFAULT_IMAGE_PASTE_INPUT = "\x16";
+const IMAGE_MARKER_RE = /\[Image-#(\d+)\]/g;
+const CLIPBOARD_IMAGE_PATH_RE = /(?:^|[\\/])pi-clipboard-[a-z0-9-]+\.(?:png|jpe?g|gif|webp)$/i;
 // Matches path-like tokens (absolute /…, home ~/…, relative ./…/…/) ending in a
 // known image extension. Allows \ (escaped space) which is what terminal
 // drag-and-drop produces on paths with spaces (common on macOS screenshots).
 // Unescaped-space paths are handled by the post-regex extension step below.
 const PATH_TOKEN_RE = /(?:\/|~\/|\.{1,2}\/)(?:\\ |[^\s)"'<>])+\.(?:png|jpe?g|gif|webp|bmp)/gi;
+const WINDOWS_PATH_TOKEN_RE = /[a-z]:\\[^\r\n)"'<>]*?\.(?:png|jpe?g|gif|webp|bmp)/gi;
 
-/** Map macOS Option+V to pi's built-in clipboard image paste action. */
+/**
+ * On macOS, expose Option+V as an alias for pi's built-in image paste action.
+ * Pi owns clipboard access and inserts a /tmp/pi-clipboard-* path; the input
+ * hook below then replaces that path with the configured [Image-#N] marker.
+ */
 export function remapMacOptionVPaste(
   data: string,
   platform: NodeJS.Platform = process.platform,
 ): { data: string } | undefined {
   if (platform !== "darwin" || isKeyRelease(data) || !matchesKey(data, "alt+v")) return undefined;
   return { data: PI_DEFAULT_IMAGE_PASTE_INPUT };
+}
+
+/** Tracks the real temp paths hidden behind compose-time image markers. */
+export class ComposeImageReferences {
+  private readonly pathsByIndex = new Map<number, string>();
+  private readonly indexesByPath = new Map<string, number>();
+  private nextIndex = 1;
+
+  collapse(text: string): string {
+    return this.collapseWithContext(text, text);
+  }
+
+  collapseInsertion(text: string, editorText: string): string {
+    return this.collapseWithContext(text, editorText);
+  }
+
+  private collapseWithContext(text: string, editorText: string): string {
+    let result = text;
+    IMAGE_MARKER_RE.lastIndex = 0;
+    const usedIndexes = new Set(
+      [...`${editorText}\n${text}`.matchAll(IMAGE_MARKER_RE)].map((match) => Number(match[1])),
+    );
+    IMAGE_MARKER_RE.lastIndex = 0;
+
+    for (const [index, path] of this.pathsByIndex) {
+      if (!usedIndexes.has(index)) {
+        this.pathsByIndex.delete(index);
+        this.indexesByPath.delete(path);
+      }
+    }
+    this.nextIndex = 1;
+
+    const tokens = findImagePathTokens(text);
+    const exactToken = text.trim();
+    if (CLIPBOARD_IMAGE_PATH_RE.test(exactToken) && !tokens.includes(exactToken)) {
+      tokens.push(exactToken);
+    }
+
+    for (const token of tokens) {
+      const path = token.replace(/\\ /g, " ");
+      if (!CLIPBOARD_IMAGE_PATH_RE.test(path)) continue;
+
+      let index = this.indexesByPath.get(path);
+      if (index === undefined) {
+        while (usedIndexes.has(this.nextIndex) || this.pathsByIndex.has(this.nextIndex)) {
+          this.nextIndex++;
+        }
+        index = this.nextIndex++;
+        this.indexesByPath.set(path, index);
+        this.pathsByIndex.set(index, path);
+      }
+
+      usedIndexes.add(index);
+      result = result.split(token).join(`[Image-#${index}]`);
+    }
+
+    return result;
+  }
+
+  expand(text: string): string {
+    IMAGE_MARKER_RE.lastIndex = 0;
+    return text.replace(IMAGE_MARKER_RE, (marker, rawIndex: string, offset: number, source: string) => {
+      const path = this.pathsByIndex.get(Number(rawIndex));
+      if (!path) return marker;
+      const nextCharacter = source[offset + marker.length];
+      return nextCharacter === "[" ? `${path} ` : path;
+    });
+  }
+
+  restorePaths(
+    text: string,
+    renderMarker: (index: number) => string,
+    firstIndex = 1,
+  ): string {
+    let result = text;
+    let index = firstIndex;
+    for (const path of this.pathsByIndex.values()) {
+      if (!result.includes(path)) continue;
+      result = result.split(path).join(renderMarker(index));
+      index++;
+    }
+    return result;
+  }
+
+  reset(): void {
+    this.pathsByIndex.clear();
+    this.indexesByPath.clear();
+    this.nextIndex = 1;
+  }
+}
+
+export function addComposeImageMarkersToEditor(
+  editor: EditorComponent,
+  references: ComposeImageReferences,
+  colorMarker: (marker: string) => string = (marker) => marker,
+): EditorComponent {
+  const insertTextAtCursor = editor.insertTextAtCursor?.bind(editor);
+  if (insertTextAtCursor) {
+    editor.insertTextAtCursor = (text: string) => {
+      insertTextAtCursor(references.collapseInsertion(text, editor.getText()));
+    };
+  }
+
+  const render = editor.render.bind(editor);
+  editor.render = (width: number) => render(width).map((line) => {
+    IMAGE_MARKER_RE.lastIndex = 0;
+    return line.replace(IMAGE_MARKER_RE, (marker) => colorMarker(marker));
+  });
+  return editor;
 }
 
 /**
@@ -65,14 +187,16 @@ export function remapMacOptionVPaste(
  * `existsSync` check in `resolveImageFile`.
  */
 export function findImagePathTokens(text: string): string[] {
-  const out: string[] = [];
-  PATH_TOKEN_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = PATH_TOKEN_RE.exec(text)) !== null) {
-    out.push(m[0]);
+  const matches: Array<{ token: string; index: number }> = [];
+  for (const pattern of [PATH_TOKEN_RE, WINDOWS_PATH_TOKEN_RE]) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      matches.push({ token: match[0], index: match.index });
+    }
   }
-  // Dedup, preserve order.
-  return [...new Set(out)];
+  matches.sort((a, b) => a.index - b.index);
+  return [...new Set(matches.map((match) => match.token))];
 }
 
 /** Resolve a token against cwd and return the absolute path if it's a real
@@ -220,6 +344,9 @@ let composeDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let terminalInputUnsub: (() => void) | undefined;
 /** The last set of tokens we previewed (to avoid re-rendering the same). */
 let lastPreviewTokens: string = "";
+const composeImageReferences = new ComposeImageReferences();
+let previousEditorFactory: EditorFactory | undefined;
+let installedEditorFactory: EditorFactory | undefined;
 
 /**
  * Compose-time auto-preview: while the user is typing, detect image paths in
@@ -234,7 +361,7 @@ async function updateComposePreview(ctx: ExtensionContext): Promise<void> {
   }
   if (ctx.mode !== "tui") return; // widget is TUI-only
 
-  const editorText = ctx.ui.getEditorText();
+  const editorText = composeImageReferences.expand(ctx.ui.getEditorText());
   // Don't show compose preview for slash commands — they have their own UI
   if (editorText.trim().startsWith("/")) {
     if (lastPreviewTokens) {
@@ -296,7 +423,25 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
   _pi.on("session_start", (_event, ctx) => {
     // Register terminal input listener for compose-time preview
     if (terminalInputUnsub) terminalInputUnsub();
+    composeImageReferences.reset();
     if (ctx.hasUI && ctx.mode === "tui") {
+      const currentFactory = ctx.ui.getEditorComponent();
+      const baseFactory = currentFactory === installedEditorFactory
+        ? previousEditorFactory
+        : currentFactory;
+      const wrapperFactory: EditorFactory = (tui, theme, keybindings) => {
+        const editor = baseFactory?.(tui, theme, keybindings)
+          ?? new CustomEditor(tui, theme, keybindings);
+        return addComposeImageMarkersToEditor(
+          editor,
+          composeImageReferences,
+          (marker) => ctx.ui.theme.fg("accent", marker),
+        );
+      };
+      previousEditorFactory = baseFactory;
+      installedEditorFactory = wrapperFactory;
+      ctx.ui.setEditorComponent(wrapperFactory);
+
       terminalInputUnsub = ctx.ui.onTerminalInput((_data: string) => {
         // Debounce: clear existing timer, set new one
         if (composeDebounceTimer) clearTimeout(composeDebounceTimer);
@@ -308,7 +453,7 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
     }
   });
 
-  _pi.on("session_shutdown", () => {
+  _pi.on("session_shutdown", (_event, ctx) => {
     if (composeDebounceTimer) {
       clearTimeout(composeDebounceTimer);
       composeDebounceTimer = undefined;
@@ -317,7 +462,18 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
       terminalInputUnsub();
       terminalInputUnsub = undefined;
     }
+    if (
+      installedEditorFactory
+      && ctx.mode === "tui"
+      && typeof ctx.ui.getEditorComponent === "function"
+      && ctx.ui.getEditorComponent() === installedEditorFactory
+    ) {
+      ctx.ui.setEditorComponent(previousEditorFactory);
+    }
+    previousEditorFactory = undefined;
+    installedEditorFactory = undefined;
     lastPreviewTokens = "";
+    composeImageReferences.reset();
   });
 
   _pi.on("input", async (event, ctx) => {
@@ -332,8 +488,12 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
     const config = getSharedConfig();
     if (!config) return { action: "continue" as const }; // before session_start
 
-    const tokens = findImagePathTokens(event.text);
-    if (tokens.length === 0) return { action: "continue" as const };
+    const expandedText = composeImageReferences.expand(event.text);
+    const tokens = findImagePathTokens(expandedText);
+    if (tokens.length === 0) {
+      composeImageReferences.reset();
+      return { action: "continue" as const };
+    }
 
     const multimodal = isMultimodal(ctx.model);
     const { loaded, existingHashes } = await loadAndDedup(
@@ -341,14 +501,31 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
       event.images ?? [],
       ctx.cwd,
     );
+    const firstUnresolvedIndex = (multimodal ? (event.images?.length ?? 0) : 0) + loaded.length + 1;
 
-    if (loaded.length === 0) return { action: "continue" as const };
+    if (loaded.length === 0) {
+      const text = composeImageReferences.restorePaths(
+        expandedText,
+        (index) => styleMarker(index, config.markerStyle),
+        firstUnresolvedIndex,
+      );
+      composeImageReferences.reset();
+      return text === event.text
+        ? { action: "continue" as const }
+        : { action: "transform" as const, text };
+    }
 
     // Build the resolved map (token → index for marker numbering).
     const resolved = buildResolvedMap(tokens, loaded, event.images ?? [], multimodal);
 
     // Render markers in the text.
-    let text = renderMarkers(event.text, tokens, resolved, config.markerStyle);
+    let text = renderMarkers(expandedText, tokens, resolved, config.markerStyle);
+    text = composeImageReferences.restorePaths(
+      text,
+      (index) => styleMarker(index, config.markerStyle),
+      firstUnresolvedIndex,
+    );
+    composeImageReferences.reset();
 
     if (multimodal) {
       // ── MULTIMODAL: attach images + markers (B-lite delivery + gap #6) ──

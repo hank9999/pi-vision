@@ -175,7 +175,11 @@ function makeCtx(opts: {
   signal?: AbortSignal;
 } = {}): ExtensionContext {
   return {
-    ui: { notify: () => {} },
+    ui: {
+      notify: () => {},
+      getEditorComponent: () => undefined,
+      setEditorComponent: () => {},
+    },
     mode: "tui",
     hasUI: false,
     cwd: opts.cwd ?? "/tmp",
@@ -1571,6 +1575,121 @@ test("T51: clipboard paste path (/tmp/pi-clipboard-<uuid>.png) detected + marker
     assert.ok((inputResult.images ?? []).length >= 1, "★ clipboard image attached");
     assert.equal(inputResult.images[0].mimeType, "image/png");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T51a: clipboard paste paths become sequential markers at the cursor before submit", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const clipPath = join(dir, "pi-clipboard-4f1c2a8b-9d4e-4f7a-bb21-6e8c1f2a7b9c.png");
+  const clipPath2 = join(dir, "pi-clipboard-5f1c2a8b-9d4e-4f7a-bb21-6e8c1f2a7b9c.png");
+  writeFileSync(clipPath, PNG_BYTES);
+  writeFileSync(clipPath2, PNG_BYTES_2);
+  let editorText = "analyze after";
+  let cursor = "analyze ".length;
+  let editorFactory: any;
+  let currentEditorFactory: any;
+  let ctx: any;
+
+  try {
+    ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.hasUI = true;
+    ctx.ui.getEditorText = () => editorText;
+    ctx.ui.setWidget = () => {};
+    ctx.ui.onTerminalInput = (handler: any) => { ctx._inputHandler = handler; return () => {}; };
+    const baseEditor = {
+      getText: () => editorText,
+      setText: (text: string) => { editorText = text; cursor = text.length; },
+      insertTextAtCursor: (text: string) => {
+        editorText = editorText.slice(0, cursor) + text + editorText.slice(cursor);
+        cursor += text.length;
+      },
+      handleInput: () => {},
+      render: () => [],
+      invalidate: () => {},
+    };
+    currentEditorFactory = () => baseEditor;
+    ctx.ui.getEditorComponent = () => currentEditorFactory;
+    ctx.ui.setEditorComponent = (factory: any) => {
+      currentEditorFactory = factory;
+      editorFactory = factory;
+    };
+
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+    await pi.emit("session_start", { type: "session_start", reason: "reload" }, ctx);
+    assert.ok(editorFactory, "image-aware editor factory installed");
+    const editor = editorFactory({}, {}, {});
+
+    editor.insertTextAtCursor(clipPath);
+    assert.equal(editorText, "analyze [Image-#1]after", "editor displays a compact marker at the cursor");
+    assert.equal(cursor, "analyze [Image-#1]".length, "cursor remains immediately after the marker");
+    editor.insertTextAtCursor(clipPath2);
+    assert.equal(
+      editorText,
+      "analyze [Image-#1][Image-#2]after",
+      "rapid consecutive inserts receive sequential markers without a race",
+    );
+
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: editorText, source: "interactive", images: [] },
+      ctx,
+    );
+    assert.match(inputResult.text, /`\[Image-#1\]`/, "submitted text keeps the configured marker rendering");
+    assert.equal(inputResult.images.length, 2, "both markers expand back to their real image paths");
+  } finally {
+    if (ctx) await pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T51b: an unreadable pasted image stays a marker and never leaks its temp path", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const goodPath = join(dir, "pi-clipboard-6f1c2a8b-9d4e-4f7a-bb21-6e8c1f2a7b9c.png");
+  const missingPath = join(dir, "pi-clipboard-7f1c2a8b-9d4e-4f7a-bb21-6e8c1f2a7b9c.png");
+  writeFileSync(goodPath, PNG_BYTES);
+  let editorText = "";
+  let ctx: any;
+
+  try {
+    ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.hasUI = true;
+    ctx.ui.getEditorText = () => editorText;
+    ctx.ui.setWidget = () => {};
+    ctx.ui.onTerminalInput = () => () => {};
+    const baseEditor = {
+      getText: () => editorText,
+      setText: (text: string) => { editorText = text; },
+      insertTextAtCursor: (text: string) => { editorText += text; },
+      handleInput: () => {},
+      render: () => [],
+      invalidate: () => {},
+    };
+    let currentFactory: any = () => baseEditor;
+    ctx.ui.getEditorComponent = () => currentFactory;
+    ctx.ui.setEditorComponent = (factory: any) => { currentFactory = factory; };
+
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+    const editor = currentFactory({}, {}, {});
+    editor.insertTextAtCursor(missingPath);
+    editor.insertTextAtCursor(goodPath);
+
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: editorText, source: "interactive", images: [] },
+      ctx,
+    );
+    assert.equal(inputResult.images.length, 1, "the readable image remains attached");
+    assert.match(inputResult.text, /`\[Image-#2\]`/, "the unreadable image remains a marker");
+    assert.ok(!inputResult.text.includes(missingPath), "the unreadable temp path is not exposed");
+  } finally {
+    if (ctx) await pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
     rmSync(dir, { recursive: true, force: true });
   }
 });
