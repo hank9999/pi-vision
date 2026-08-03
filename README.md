@@ -217,7 +217,9 @@ unable to call it). Paste 2+ images and the model learns it can pass them all
 to `image_paths` for batch analysis.
 
 **Clipboard paste just works.** Pi binds `ctrl+v` (`alt+v` on Windows) to
-paste the system clipboard image: it reads the clipboard, writes the bytes to
+paste the system clipboard image. On macOS, this extension also maps
+`option+v` to that built-in action (the terminal must report Option as Alt).
+Pi reads the clipboard, writes the bytes to
 `/tmp/pi-clipboard-<uuid>.<ext>`, and inserts that path at the cursor. Our
 existing path-token pipeline detects it, renders a `[Image-#N]` marker, and
 attaches (multimodal) or delegates (text-only) — no separate clipboard code

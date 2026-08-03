@@ -1,6 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findImagePathTokens } from "../extensions/paste.ts";
+import {
+  findImagePathTokens,
+  remapMacOptionVPaste,
+} from "../extensions/paste.ts";
+
+test("remapMacOptionVPaste: macOS Option+V forwards to pi's image-paste input", () => {
+  assert.deepEqual(remapMacOptionVPaste("\x1bv", "darwin"), { data: "\x16" });
+  assert.deepEqual(remapMacOptionVPaste("\x1b[118;3u", "darwin"), { data: "\x16" });
+});
+
+test("remapMacOptionVPaste: leaves other keys and platforms unchanged", () => {
+  assert.equal(remapMacOptionVPaste("v", "darwin"), undefined);
+  assert.equal(remapMacOptionVPaste("\x1bV", "darwin"), undefined);
+  assert.equal(remapMacOptionVPaste("\x1b[118;3:3u", "darwin"), undefined);
+  assert.equal(remapMacOptionVPaste("\x1bv", "linux"), undefined);
+  assert.equal(remapMacOptionVPaste("\x1bv", "win32"), undefined);
+});
 
 test("findImagePathTokens: absolute path", () => {
   assert.deepEqual(findImagePathTokens("analyze /tmp/screenshot.png"), ["/tmp/screenshot.png"]);

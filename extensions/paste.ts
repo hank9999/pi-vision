@@ -29,6 +29,7 @@ import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { isMultimodal } from "../lib/capability.ts";
 import { loadImage } from "../lib/image.ts";
 import { renderMarkers, buildHintLine, buildDescriptionsBlock } from "../lib/marker.ts";
@@ -39,11 +40,21 @@ import { createComposePreviewComponent, makePreviewImage } from "../lib/preview.
 import { mapWithConcurrency } from "../lib/batch.ts";
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
+const PI_DEFAULT_IMAGE_PASTE_INPUT = "\x16";
 // Matches path-like tokens (absolute /…, home ~/…, relative ./…/…/) ending in a
 // known image extension. Allows \ (escaped space) which is what terminal
 // drag-and-drop produces on paths with spaces (common on macOS screenshots).
 // Unescaped-space paths are handled by the post-regex extension step below.
 const PATH_TOKEN_RE = /(?:\/|~\/|\.{1,2}\/)(?:\\ |[^\s)"'<>])+\.(?:png|jpe?g|gif|webp|bmp)/gi;
+
+/** Map macOS Option+V to pi's built-in clipboard image paste action. */
+export function remapMacOptionVPaste(
+  data: string,
+  platform: NodeJS.Platform = process.platform,
+): { data: string } | undefined {
+  if (platform !== "darwin" || isKeyRelease(data) || !matchesKey(data, "alt+v")) return undefined;
+  return { data: PI_DEFAULT_IMAGE_PASTE_INPUT };
+}
 
 /**
  * Extract candidate image file-path tokens from free text. Matches path-like
@@ -292,7 +303,7 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
         composeDebounceTimer = setTimeout(() => {
           updateComposePreview(ctx).catch(() => {});
         }, 300);
-        return undefined; // don't consume — let the editor process normally
+        return remapMacOptionVPaste(_data);
       });
     }
   });
