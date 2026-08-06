@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  AssistantMessage,
+  Context,
+  Model,
+  SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   callVisionModel,
@@ -32,58 +38,111 @@ function makeVisionModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
   };
 }
 
-interface FetchCall {
-  url: string;
-  init: RequestInit;
+interface TransportCall {
+  model: Model<Api>;
+  context: Context;
+  options: SimpleStreamOptions | undefined;
 }
 
-function mockFetch(response: { status: number; body: unknown }): {
-  calls: FetchCall[];
+interface MockProvider {
+  calls: TransportCall[];
+  transport: {
+    streamSimple(
+      model: Model<Api>,
+      context: Context,
+      options?: SimpleStreamOptions,
+    ): any;
+  };
   restore: () => void;
-} {
-  const calls: FetchCall[] = [];
-  const original = globalThis.fetch;
-  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-    calls.push({ url: String(url), init: init ?? {} });
-    return new Response(JSON.stringify(response.body), {
-      status: response.status,
-      headers: { "Content-Type": "application/json" },
-    });
-  }) as typeof globalThis.fetch;
-  return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
-function mockFetchError(status: number, body: string): {
-  calls: FetchCall[];
-  restore: () => void;
-} {
-  const calls: FetchCall[] = [];
-  const original = globalThis.fetch;
-  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-    calls.push({ url: String(url), init: init ?? {} });
-    return new Response(body, { status });
-  }) as typeof globalThis.fetch;
-  return { calls, restore: () => { globalThis.fetch = original; } };
+let activeTransport: MockProvider["transport"] | undefined;
+
+function assistantMessage(
+  model: Model<Api>,
+  content: AssistantMessage["content"],
+  stopReason: AssistantMessage["stopReason"],
+  errorMessage?: string,
+): AssistantMessage {
+  return {
+    role: "assistant",
+    content,
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason,
+    errorMessage,
+    timestamp: Date.now(),
+  };
 }
 
-/** Mock fetch that returns a queued sequence of responses (one per call). */
 function mockFetchSeq(responses: { status: number; body: unknown }[]): {
-  calls: FetchCall[];
+  calls: TransportCall[];
+  transport: MockProvider["transport"];
   restore: () => void;
 } {
-  const calls: FetchCall[] = [];
-  const original = globalThis.fetch;
+  const calls: TransportCall[] = [];
   let i = 0;
-  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-    calls.push({ url: String(url), init: init ?? {} });
-    const r = responses[Math.min(i, responses.length - 1)]!;
-    i++;
-    return new Response(JSON.stringify(r.body), {
-      status: r.status,
-      headers: { "Content-Type": "application/json" },
-    });
-  }) as typeof globalThis.fetch;
-  return { calls, restore: () => { globalThis.fetch = original; } };
+  const transport: MockProvider["transport"] = {
+    streamSimple(model, context, options) {
+      calls.push({ model, context, options });
+      const response = responses[Math.min(i, responses.length - 1)]!;
+      i++;
+      return {
+        result: async () => {
+          if (options?.signal?.aborted) {
+            return assistantMessage(model, [], "aborted", "Aborted");
+          }
+          await options?.onResponse?.(
+            { status: response.status, headers: {} },
+            model,
+          );
+          if (response.status >= 400) {
+            const detail = typeof response.body === "string"
+              ? response.body
+              : JSON.stringify(response.body);
+            return assistantMessage(model, [], "error", detail);
+          }
+          const body = response.body as {
+            choices?: Array<{
+              message?: { content?: string; reasoning_content?: string };
+            }>;
+          };
+          const message = body.choices?.[0]?.message;
+          const content: AssistantMessage["content"] = message?.content
+            ? [{ type: "text", text: message.content }]
+            : message?.reasoning_content
+              ? [{ type: "thinking", thinking: message.reasoning_content }]
+              : [];
+          return assistantMessage(model, content, "stop");
+        },
+      };
+    },
+  };
+  activeTransport = transport;
+  return {
+    calls,
+    transport,
+    restore: () => {
+      if (activeTransport === transport) activeTransport = undefined;
+    },
+  };
+}
+
+function mockFetch(response: { status: number; body: unknown }): MockProvider {
+  return mockFetchSeq([response]);
+}
+
+function mockFetchError(status: number, body: string): MockProvider {
+  return mockFetch({ status, body });
 }
 
 function makeCtx(opts: {
@@ -93,12 +152,14 @@ function makeCtx(opts: {
   apiKey?: string;
   headers?: Record<string, string>;
   cwd?: string;
+  transport?: MockProvider["transport"];
 }): ExtensionContext {
   const model = opts.model ?? makeVisionModel();
   return {
     cwd: opts.cwd ?? "/tmp",
     modelRegistry: {
       find: () => opts.model === null ? undefined : model,
+      getProvider: () => opts.transport ?? activeTransport,
       getApiKeyAndHeaders: async () =>
         opts.authOk === false
           ? { ok: false, error: opts.authError ?? "no api key" }
@@ -111,13 +172,14 @@ function tmpDir(): string {
   return mkdtempSync(join(tmpdir(), "vision-delegate-"));
 }
 
-test("callVisionModel: sends chat/completions POST with image data URL + prompt", async () => {
+test("callVisionModel: sends normalized image context through Pi transport", async () => {
   const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "a red square" } }] } });
   try {
+    const model = makeVisionModel({ api: "openai-responses" as Api });
     const text = await callVisionModel(
-      makeVisionModel(),
-      "key-123",
-      undefined,
+      model,
+      m.transport,
+      { ok: true, apiKey: "key-123", baseUrl: "https://resolved.example/v1" },
       { data: PNG_1x1_B64, mimeType: "image/png" },
       "describe this",
       undefined,
@@ -125,19 +187,18 @@ test("callVisionModel: sends chat/completions POST with image data URL + prompt"
     );
     assert.equal(text, "a red square");
     assert.equal(m.calls.length, 1);
-    assert.equal(m.calls[0]!.url, "http://localhost:11434/v1/chat/completions");
-    const init = m.calls[0]!.init;
-    assert.equal(init.method, "POST");
-    const headers = init.headers as Record<string, string>;
-    assert.equal(headers.Authorization, "Bearer key-123");
-    assert.equal(headers["Content-Type"], "application/json");
-    const body = JSON.parse(init.body as string);
-    assert.equal(body.model, "minimax-m3:cloud");
-    assert.equal(body.messages[0].role, "user");
-    assert.equal(body.messages[0].content[0].type, "image_url");
-    assert.ok(body.messages[0].content[0].image_url.url.startsWith("data:image/png;base64,"));
-    assert.equal(body.messages[0].content[1].text, "describe this");
-    assert.equal(body.temperature, 0);
+    const call = m.calls[0]!;
+    assert.equal(call.model.api, "openai-responses", "model API is preserved for provider dispatch");
+    assert.equal(call.model.baseUrl, "https://resolved.example/v1", "resolved auth can override the endpoint");
+    assert.equal(call.context.messages[0]!.role, "user");
+    const content = call.context.messages[0]!.content;
+    assert.ok(Array.isArray(content));
+    assert.deepEqual(content.map((part) => part.type), ["image", "text"]);
+    assert.deepEqual(content[0], { type: "image", data: PNG_1x1_B64, mimeType: "image/png" });
+    assert.deepEqual(content[1], { type: "text", text: "describe this" });
+    assert.equal(call.options?.apiKey, "key-123");
+    assert.equal(call.options?.temperature, undefined, "provider uses its protocol-safe default");
+    assert.equal(call.options?.maxTokens, 4096);
   } finally {
     m.restore();
   }
@@ -151,8 +212,8 @@ test("callVisionModel: falls back to reasoning_content when content is empty", a
   try {
     const text = await callVisionModel(
       makeVisionModel(),
-      undefined,
-      undefined,
+      m.transport,
+      { ok: true },
       { data: PNG_1x1_B64, mimeType: "image/png" },
       "what color",
       undefined,
@@ -164,71 +225,70 @@ test("callVisionModel: falls back to reasoning_content when content is empty", a
   }
 });
 
-test("callVisionModel: includes reasoning_effort when model.reasoning + level != off", async () => {
+test("callVisionModel: passes generic reasoning through Pi transport", async () => {
   const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
   try {
     await callVisionModel(
       makeVisionModel({ reasoning: true }),
-      "k",
-      undefined,
+      m.transport,
+      { ok: true, apiKey: "k" },
       { data: PNG_1x1_B64, mimeType: "image/png" },
       "p",
       undefined,
       "high",
     );
-    const body = JSON.parse(m.calls[0]!.init.body as string);
-    assert.equal(body.reasoning_effort, "high");
+    assert.equal(m.calls[0]!.options?.reasoning, "high");
   } finally {
     m.restore();
   }
 });
 
-test("callVisionModel: omits reasoning_effort when level is off", async () => {
+test("callVisionModel: omits generic reasoning when level is off", async () => {
   const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
   try {
     await callVisionModel(
       makeVisionModel({ reasoning: true }),
-      "k",
-      undefined,
+      m.transport,
+      { ok: true, apiKey: "k" },
       { data: PNG_1x1_B64, mimeType: "image/png" },
       "p",
       undefined,
       "off",
     );
-    const body = JSON.parse(m.calls[0]!.init.body as string);
-    assert.equal(body.reasoning_effort, undefined);
+    assert.equal(m.calls[0]!.options?.reasoning, undefined);
   } finally {
     m.restore();
   }
 });
 
-test("callVisionModel: merges provider headers", async () => {
+test("callVisionModel: forwards resolved provider auth", async () => {
   const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
   try {
     await callVisionModel(
       makeVisionModel(),
-      "k",
-      { "X-Custom": "yes" },
+      m.transport,
+      { ok: true, apiKey: "k", headers: { "X-Custom": "yes" }, env: { REGION: "test" } },
       { data: PNG_1x1_B64, mimeType: "image/png" },
       "p",
       undefined,
       "off",
     );
-    const headers = m.calls[0]!.init.headers as Record<string, string>;
-    assert.equal(headers["X-Custom"], "yes");
+    assert.equal(m.calls[0]!.options?.apiKey, "k");
+    assert.equal(m.calls[0]!.options?.headers?.["X-Custom"], "yes");
+    assert.equal(m.calls[0]!.options?.env?.REGION, "test");
   } finally {
     m.restore();
   }
 });
 
-test("callVisionModel: HTTP error throws with status + body excerpt", async () => {
+test("callVisionModel: provider error includes the observed HTTP status", async () => {
   const m = mockFetchError(500, "internal server boom");
   try {
     await assert.rejects(
       callVisionModel(
         makeVisionModel(),
-        "k",
-        undefined,
+        m.transport,
+        { ok: true, apiKey: "k" },
         { data: PNG_1x1_B64, mimeType: "image/png" },
         "p",
         undefined,
@@ -247,8 +307,8 @@ test("callVisionModel: no content in response throws", async () => {
     await assert.rejects(
       callVisionModel(
         makeVisionModel(),
-        "k",
-        undefined,
+        m.transport,
+        { ok: true, apiKey: "k" },
         { data: PNG_1x1_B64, mimeType: "image/png" },
         "p",
         undefined,
@@ -258,6 +318,146 @@ test("callVisionModel: no content in response throws", async () => {
     );
   } finally {
     m.restore();
+  }
+});
+
+test("delegateToVisionModel: reuses the registered Pi provider transport", async () => {
+  const dir = tmpDir();
+  const file = join(dir, "pixel.png");
+  writeFileSync(file, PNG_BYTES);
+
+  const model = makeVisionModel({
+    api: "openai-responses" as Api,
+    provider: "openai-third",
+    id: "gpt-5.6-terra",
+    baseUrl: "https://gateway.example/v1",
+    reasoning: true,
+  });
+  let transportCall: {
+    model: Model<Api>;
+    context: any;
+    options: any;
+  } | undefined;
+  const provider = {
+    streamSimple(requestModel: Model<Api>, context: any, options: any) {
+      transportCall = { model: requestModel, context, options };
+      return {
+        result: async () => ({
+          role: "assistant",
+          content: [{ type: "text", text: "described through Pi" }],
+          api: requestModel.api,
+          provider: requestModel.provider,
+          model: requestModel.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        }),
+      };
+    },
+  };
+  const ctx = {
+    cwd: dir,
+    modelRegistry: {
+      find: () => model,
+      getProvider: () => provider,
+      getApiKeyAndHeaders: async () => ({
+        ok: true,
+        apiKey: "provider-key",
+        headers: { "X-Provider": "yes" },
+      }),
+    },
+  } as unknown as ExtensionContext;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("delegate bypassed Pi provider transport");
+  }) as typeof globalThis.fetch;
+  try {
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      provider: "openai-third",
+      model: "gpt-5.6-terra",
+      systemPrompt: "Analyze visible UI precisely.",
+      retryAttempts: 0,
+    };
+    const result = await delegateToVisionModel(ctx, cfg, {
+      image_path: file,
+      prompt: "read the screenshot",
+      compress: false,
+      reasoning: "high",
+    }, undefined);
+
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.text, "described through Pi");
+    assert.ok(transportCall, "registered provider transport was called");
+    assert.equal(transportCall.model.api, "openai-responses");
+    assert.equal(transportCall.context.systemPrompt, "Analyze visible UI precisely.");
+    assert.deepEqual(
+      transportCall.context.messages[0].content.map((part: { type: string }) => part.type),
+      ["image", "text"],
+    );
+    assert.equal(transportCall.options.apiKey, "provider-key");
+    assert.equal(transportCall.options.headers["X-Provider"], "yes");
+    assert.equal(transportCall.options.reasoning, "high");
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: Pi <0.84 falls back to the registered API transport", async () => {
+  const dir = tmpDir();
+  const file = join(dir, "pixel.png");
+  writeFileSync(file, PNG_BYTES);
+  const api = "vision-test-legacy-api" as Api;
+  const sourceId = "getpipher-vision-legacy-transport-test";
+  const model = makeVisionModel({ api, provider: "legacy-provider" });
+  const mock = mockFetch({
+    status: 200,
+    body: { choices: [{ message: { content: "legacy transport response" } }] },
+  });
+  const { registerApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
+  registerApiProvider({
+    api,
+    stream: mock.transport.streamSimple as any,
+    streamSimple: mock.transport.streamSimple as any,
+  }, sourceId);
+  const ctx = {
+    cwd: dir,
+    modelRegistry: {
+      find: () => model,
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "legacy-key" }),
+      // Intentionally no getProvider(): this is the pre-0.84 registry shape.
+    },
+  } as unknown as ExtensionContext;
+
+  try {
+    const result = await delegateToVisionModel(ctx, {
+      ...DEFAULT_CONFIG,
+      provider: "legacy-provider",
+      model: model.id,
+      retryAttempts: 0,
+    }, {
+      image_path: file,
+      prompt: "describe",
+      compress: false,
+      reasoning: "off",
+    }, undefined);
+
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.text, "legacy transport response");
+    assert.equal(mock.calls.length, 1);
+  } finally {
+    unregisterApiProviders(sourceId);
+    mock.restore();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -419,7 +619,7 @@ test("delegateToVisionModel: cache miss when prompt changes", async () => {
   }
 });
 
-test("delegateToVisionModel: systemPrompt set → request body has system message first", async () => {
+test("delegateToVisionModel: systemPrompt is passed through normalized context", async () => {
   const dir = tmpDir();
   const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
   try {
@@ -428,17 +628,15 @@ test("delegateToVisionModel: systemPrompt set → request body has system messag
     const ctx = makeCtx({ cwd: dir });
     const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", systemPrompt: "You are a forensic analyst." };
     await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
-    const body = JSON.parse(m.calls[0]!.init.body as string);
-    assert.equal(body.messages[0].role, "system");
-    assert.equal(body.messages[0].content, "You are a forensic analyst.");
-    assert.equal(body.messages[1].role, "user");
+    assert.equal(m.calls[0]!.context.systemPrompt, "You are a forensic analyst.");
+    assert.equal(m.calls[0]!.context.messages[0]!.role, "user");
   } finally {
     m.restore();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("delegateToVisionModel: no systemPrompt → v0.1.0 shape (user first)", async () => {
+test("delegateToVisionModel: no systemPrompt leaves normalized context unset", async () => {
   const dir = tmpDir();
   const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
   try {
@@ -447,8 +645,8 @@ test("delegateToVisionModel: no systemPrompt → v0.1.0 shape (user first)", asy
     const ctx = makeCtx({ cwd: dir });
     const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud" };
     await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
-    const body = JSON.parse(m.calls[0]!.init.body as string);
-    assert.equal(body.messages[0].role, "user", "no system message when systemPrompt unset");
+    assert.equal(m.calls[0]!.context.systemPrompt, undefined);
+    assert.equal(m.calls[0]!.context.messages[0]!.role, "user");
   } finally {
     m.restore();
     rmSync(dir, { recursive: true, force: true });

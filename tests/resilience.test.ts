@@ -12,6 +12,13 @@ test("classifyError: 500/502/503 → retryable", () => {
   assert.equal(classifyError(httpError(503)), "retryable");
 });
 
+test("classifyError: Pi provider HTTP status format → retryable", () => {
+  assert.equal(
+    classifyError(new Error('Vision model error: OpenAI API error (503): {"error":"unavailable"}')),
+    "retryable",
+  );
+});
+
 test("classifyError: 429 → retryable (rate limit)", () => {
   assert.equal(classifyError(httpError(429)), "retryable");
 });

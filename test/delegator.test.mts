@@ -3,7 +3,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isMultimodal, loadConfig, createVisionDelegator } from "../src/index.ts";
 
-// A fake ModelRegistry slice (the { find, getApiKeyAndHeaders } delegateToVisionModel reads).
+// A fake ModelRegistry slice. Transport lookup is unnecessary while the test
+// config remains unconfigured and delegation exits during preflight.
 const fakeRegistry = {
   find: () => undefined,
   getApiKeyAndHeaders: async () => ({ ok: false, error: "no auth" }),

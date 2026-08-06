@@ -18,7 +18,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
-import type { Api, Model, ImageContent } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  AssistantMessage,
+  Context,
+  ImageContent,
+  Model,
+  SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -153,6 +160,104 @@ function createMockPi(initialActive = ["read", "bash", "edit", "write"]): MockPi
   return pi;
 }
 
+function mockAssistantMessage(
+  model: Model<Api>,
+  content: AssistantMessage["content"],
+  stopReason: AssistantMessage["stopReason"],
+  errorMessage?: string,
+): AssistantMessage {
+  return {
+    role: "assistant",
+    content,
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason,
+    errorMessage,
+    timestamp: Date.now(),
+  };
+}
+
+/** Fetch-backed provider used by the integration harness. Production protocol
+ * serialization is covered separately by provider-transport.test.ts; this
+ * adapter preserves the suite's fetch timing/count/error controls while
+ * exposing Pi's normalized streamSimple contract to the extension. */
+const MOCK_PROVIDER_TRANSPORT = {
+  streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): any {
+    return {
+      result: async () => {
+        if (options?.signal?.aborted) {
+          return mockAssistantMessage(model, [], "aborted", "Aborted");
+        }
+        const messages: any[] = [];
+        if (context.systemPrompt) {
+          messages.push({ role: "system", content: context.systemPrompt });
+        }
+        for (const message of context.messages) {
+          if (message.role !== "user") continue;
+          const content = typeof message.content === "string"
+            ? message.content
+            : message.content.map((part) => part.type === "image"
+              ? {
+                  type: "image_url",
+                  image_url: { url: `data:${part.mimeType};base64,${part.data}` },
+                }
+              : part);
+          messages.push({ role: "user", content });
+        }
+        try {
+          const response = await fetch(`${model.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(options?.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+              ...(options?.headers as Record<string, string> | undefined),
+            },
+            body: JSON.stringify({ model: model.id, messages }),
+            signal: options?.signal,
+          });
+          await options?.onResponse?.(
+            { status: response.status, headers: {} },
+            model,
+          );
+          const raw = await response.text();
+          if (!response.ok) {
+            return mockAssistantMessage(model, [], "error", raw);
+          }
+          const body = JSON.parse(raw) as {
+            choices?: Array<{
+              message?: { content?: string; reasoning_content?: string };
+            }>;
+          };
+          const message = body.choices?.[0]?.message;
+          const content: AssistantMessage["content"] = message?.content
+            ? [{ type: "text", text: message.content }]
+            : message?.reasoning_content
+              ? [{ type: "thinking", thinking: message.reasoning_content }]
+              : [];
+          return mockAssistantMessage(model, content, "stop");
+        } catch (error) {
+          const aborted = options?.signal?.aborted || (error instanceof Error && error.name === "AbortError");
+          return mockAssistantMessage(
+            model,
+            [],
+            aborted ? "aborted" : "error",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      },
+    };
+  },
+};
+
 function makeRegistry(opts: {
   model?: Model<Api> | undefined;
   authOk?: boolean;
@@ -161,6 +266,7 @@ function makeRegistry(opts: {
   return {
     getAvailable: () => [],
     find: () => (opts.model === undefined ? undefined : opts.model),
+    getProvider: () => MOCK_PROVIDER_TRANSPORT,
     getApiKeyAndHeaders: async () =>
       opts.authOk === false
         ? { ok: false, error: "no api key configured" }

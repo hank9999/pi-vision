@@ -14,10 +14,18 @@
  *    secondary vision model on failure.
  * 4. Abort-aware — `ctx.signal` stops retry + skips fallback.
  *
- * Clean-room: the OpenAI-compatible `/chat/completions` request shape with a
- * base64 data-URL image is standard API usage, not copied from pi-vision-tool.
+ * Requests are dispatched through Pi's registered provider transport. The
+ * provider converts Pi's normalized image content to its native protocol
+ * (Responses, Chat Completions, Anthropic Messages, Gemini, etc.).
  */
-import type { Model, Api } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  Context,
+  Model,
+  Provider,
+  ProviderHeaders,
+  SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isConfiguredForDelegation, loadConfig, type ReasoningLevel, type VisionConfig } from "./config.ts";
@@ -59,82 +67,99 @@ export interface DelegateFailure {
 
 export type DelegateResult = DelegateSuccess | DelegateFailure;
 
-/** Build provider-specific reasoning params for the request body, if any. */
-function buildReasoningParams(
-  visionModel: Model<Api>,
-  level: ReasoningLevel,
-): Record<string, unknown> | undefined {
-  if (!visionModel.reasoning || level === "off") return undefined;
-  return { reasoning_effort: level };
+export type ResolvedVisionAuth = {
+  ok: true;
+  apiKey?: string;
+  headers?: ProviderHeaders;
+  baseUrl?: string;
+  env?: Record<string, string>;
+} | {
+  ok: false;
+  error: string;
+};
+
+export type VisionProviderTransport = Pick<Provider<Api>, "streamSimple">;
+
+async function resolveVisionTransport(
+  registry: ModelRegistryLike,
+  model: Model<Api>,
+): Promise<VisionProviderTransport | undefined> {
+  if (registry.getProvider) {
+    return registry.getProvider(model.provider);
+  }
+
+  // Pi < 0.84 exposed only the API registry to extensions. Keep that runtime
+  // compatible without restoring the old hand-written HTTP request path.
+  const { getApiProvider } = await import("@earendil-works/pi-ai/compat");
+  return getApiProvider(model.api);
 }
 
 /**
- * Call the vision model's OpenAI-compat chat/completions endpoint with the
- * image as a data URL + the user's prompt (and an optional system prompt).
- * Returns the model's text response. Exported + fetch-based so tests can mock
- * `globalThis.fetch`.
+ * Analyze an image through a Pi provider's normalized transport. The image is
+ * represented as Pi `ImageContent`; the provider owns protocol serialization,
+ * endpoint selection, streaming, and response normalization.
  */
 export async function callVisionModel(
   visionModel: Model<Api>,
-  apiKey: string | undefined,
-  providerHeaders: Record<string, string> | undefined,
+  transport: VisionProviderTransport,
+  auth: Extract<ResolvedVisionAuth, { ok: true }>,
   image: LoadedImage,
   prompt: string,
   signal: AbortSignal | undefined,
   reasoning: ReasoningLevel,
   systemPrompt?: string,
 ): Promise<string> {
-  const baseUrl = visionModel.baseUrl.replace(/\/+$/, "");
-  const messages: unknown[] = [];
-  if (systemPrompt && systemPrompt.length > 0) {
-    messages.push({ role: "system", content: systemPrompt });
-  }
-  messages.push({
-    role: "user",
-    content: [
-      {
-        type: "image_url",
-        image_url: { url: `data:${image.mimeType};base64,${image.data}` },
-      },
-      { type: "text", text: prompt },
-    ],
-  });
-  const body: Record<string, unknown> = {
-    model: visionModel.id,
-    messages,
-    max_tokens: 4096,
-    temperature: 0,
+  const context: Context = {
+    ...(systemPrompt ? { systemPrompt } : {}),
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image", data: image.data, mimeType: image.mimeType },
+        { type: "text", text: prompt },
+      ],
+      timestamp: Date.now(),
+    }],
   };
-  const reasoningParams = buildReasoningParams(visionModel, reasoning);
-  if (reasoningParams) Object.assign(body, reasoningParams);
 
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  if (providerHeaders) Object.assign(headers, providerHeaders);
-
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
+  const requestModel = auth.baseUrl
+    ? { ...visionModel, baseUrl: auth.baseUrl }
+    : visionModel;
+  let responseStatus: number | undefined;
+  const options: SimpleStreamOptions = {
+    apiKey: auth.apiKey,
+    headers: auth.headers,
+    env: auth.env,
     signal,
-  });
+    maxTokens: 4096,
+    ...(visionModel.reasoning && reasoning !== "off" ? { reasoning } : {}),
+    onResponse: (response) => {
+      responseStatus = response.status;
+    },
+  };
+  const response = await transport.streamSimple(requestModel, context, options).result();
 
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => "");
-    throw new Error(
-      `Vision model returned ${response.status}: ${errBody.slice(0, 500)}`,
-    );
+  if (response.stopReason === "aborted") {
+    throw new AbortError(response.errorMessage ?? "Vision model request aborted");
+  }
+  if (response.stopReason === "error") {
+    const detail = response.errorMessage ?? "Unknown provider error";
+    const status = responseStatus ? ` returned ${responseStatus}:` : " error:";
+    throw new Error(`Vision model${status} ${detail}`);
   }
 
-  const json = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
-  };
-  const msg = json.choices?.[0]?.message;
-  const text = msg?.content || msg?.reasoning_content;
-  if (!text) {
+  const text = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+  const thinking = response.content
+    .filter((block) => block.type === "thinking")
+    .map((block) => block.thinking)
+    .join("\n");
+  const description = text || thinking;
+  if (!description) {
     throw new Error("Vision model returned no content in the response");
   }
-  return text;
+  return description;
 }
 
 function formatImageError(error: { code: string; path?: string; message?: string }, inputPath: string): string {
@@ -232,7 +257,8 @@ export async function delegateToVisionModel(
     return { ok: false, error: { code: "not_configured", message: NOT_CONFIGURED_MSG } };
   }
 
-  const visionModel = ctx.modelRegistry.find(config.provider!, config.model!);
+  const registry = ctx.modelRegistry as unknown as ModelRegistryLike;
+  const visionModel = registry.find(config.provider!, config.model!);
   if (!visionModel) {
     return {
       ok: false,
@@ -250,7 +276,7 @@ export async function delegateToVisionModel(
     };
   }
 
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(visionModel);
+  const auth = await registry.getApiKeyAndHeaders(visionModel);
   if (!auth.ok) {
     return {
       ok: false,
@@ -331,8 +357,18 @@ export async function delegateToVisionModel(
   }
 
   // ── Network call (single path) ───────────────────────────────────────
+  const transport = await resolveVisionTransport(registry, visionModel);
+  if (!transport) {
+    return {
+      ok: false,
+      error: {
+        code: "provider_not_found",
+        message: `Vision tool error: provider transport "${visionModel.provider}" was not found in Pi's model registry.`,
+      },
+    };
+  }
   const t0 = performance.now();
-  const result = await callWithRetryAndFallback(ctx, config, params, signal, visionModel, auth.apiKey, auth.headers, loaded.image, modelId, baseDetails);
+  const result = await callWithRetryAndFallback(ctx, config, params, signal, visionModel, transport, auth, loaded.image, modelId, baseDetails);
   const latency_ms = Math.round(performance.now() - t0);
 
   // Cache store on success (unchanged semantics from v0.4.0).
@@ -374,15 +410,15 @@ async function callWithRetryAndFallback(
   params: DelegateParams,
   signal: AbortSignal | undefined,
   primaryModel: Model<Api>,
-  apiKey: string | undefined,
-  headers: Record<string, string> | undefined,
+  transport: VisionProviderTransport,
+  auth: Extract<ResolvedVisionAuth, { ok: true }>,
   image: LoadedImage,
   modelId: string,
   baseDetails: Omit<DelegateSuccess["details"], "cached" | "fallback">,
 ): Promise<DelegateResult> {
   try {
     const text = await withRetry(
-      () => callVisionModel(primaryModel, apiKey, headers, image, params.prompt, signal, params.reasoning, config.systemPrompt),
+      () => callVisionModel(primaryModel, transport, auth, image, params.prompt, signal, params.reasoning, config.systemPrompt),
       { attempts: config.retryAttempts, backoffMs: config.retryBackoffMs, signal },
     );
     return { ok: true, text, details: { ...baseDetails, cached: false, fallback: false } };
@@ -411,7 +447,8 @@ async function runFallback(
   primaryErr: unknown,
 ): Promise<DelegateResult> {
   const fallbackId = `${config.fallbackProvider}/${config.fallbackModel}`;
-  const fbModel = ctx.modelRegistry.find(config.fallbackProvider!, config.fallbackModel!);
+  const registry = ctx.modelRegistry as unknown as ModelRegistryLike;
+  const fbModel = registry.find(config.fallbackProvider!, config.fallbackModel!);
   if (!fbModel) {
     return {
       ok: false,
@@ -419,7 +456,7 @@ async function runFallback(
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
   }
-  const fbAuth = await ctx.modelRegistry.getApiKeyAndHeaders(fbModel);
+  const fbAuth = await registry.getApiKeyAndHeaders(fbModel);
   if (!fbAuth.ok) {
     return {
       ok: false,
@@ -430,8 +467,19 @@ async function runFallback(
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
   }
+  const fbTransport = await resolveVisionTransport(registry, fbModel);
+  if (!fbTransport) {
+    return {
+      ok: false,
+      error: {
+        code: "provider_not_found",
+        message: `Vision tool error: fallback provider transport "${fbModel.provider}" was not found in Pi's model registry.`,
+      },
+      details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
+    };
+  }
   try {
-    const text = await callVisionModel(fbModel, fbAuth.apiKey, fbAuth.headers, image, params.prompt, signal, params.reasoning, config.systemPrompt);
+    const text = await callVisionModel(fbModel, fbTransport, fbAuth, image, params.prompt, signal, params.reasoning, config.systemPrompt);
     return {
       ok: true,
       text,
@@ -457,18 +505,19 @@ async function runFallback(
   }
 }
 // ── ModelRegistry-backed delegator (SPEC-2: for non-extension consumers like armory-fleet).
-// Takes a ModelRegistry (the { find, getApiKeyAndHeaders } slice delegateToVisionModel reads)
+// Takes a ModelRegistry (model lookup + auth + provider transport resolution)
 // so consumers with a ModelRuntime construct `new ModelRegistry(modelRuntime)` themselves
 // (ModelRegistry is exported by @earendil-works/pi-coding-agent) and pass it here.
 // This keeps vision free of ModelRuntime coupling and is unit-testable with a trivial fake.
 
 export interface ModelRegistryLike {
   find(provider: string, modelId: string): Model<Api> | undefined;
-  getApiKeyAndHeaders(model: Model<Api>): Promise<unknown>;
+  getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedVisionAuth>;
+  getProvider?(provider: string): VisionProviderTransport | undefined;
 }
 
 export interface VisionDelegatorDeps {
-  /** A ModelRegistry (or the minimal { find, getApiKeyAndHeaders } slice). */
+  /** A ModelRegistry, including provider transport lookup on modern Pi. */
   modelRegistry: ModelRegistryLike;
   /** The cwd for image path resolution. */
   cwd: string;

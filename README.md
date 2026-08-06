@@ -327,7 +327,7 @@ there's nothing to migrate. Uninstall pi-paster, run `/vision`, done.
 
 ## How it works
 
-Two mechanisms combine to guarantee the behavior:
+Three mechanisms combine to guarantee the behavior:
 
 1. **Conditional tool availability (mechanism A).** `describe_image` is always
    *registered*, but its visibility to the LLM is toggled with
@@ -344,6 +344,16 @@ Two mechanisms combine to guarantee the behavior:
    does NOT attach images — instead it hints, auto-delegates, or stays silent
    based on `textOnlyPasteMode`. The hook dedups by data hash so it coexists
    cleanly with other paste extensions during transition.
+
+3. **Provider-native delegation transport.** In DELEGATE mode the extension
+   builds Pi's normalized `Context` with native `ImageContent`, then dispatches
+   it through the vision model's registered Pi provider. The provider owns
+   endpoint selection, request serialization, streaming, and response
+   normalization. A model configured with `api: "openai-responses"` therefore
+   uses `/responses` + `input_image`; an `openai-completions` model uses
+   `/chat/completions` + `image_url`; Anthropic, Gemini, and custom providers
+   use their own registered transports. The extension never hardcodes an API
+   protocol or appends `/chat/completions` itself.
 
 ## Using `describe_image`
 

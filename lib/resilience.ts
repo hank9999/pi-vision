@@ -26,7 +26,7 @@ export type ErrorClass = "retryable" | "client" | "abort" | "no_content";
 /**
  * Classify a thrown error to decide retry behavior.
  *
- * - `retryable`: HTTP 5xx, 429 (rate limit), network errors (fetch throws
+ * - `retryable`: HTTP 5xx, 429 (rate limit), network errors (transport throws
  *   `TypeError`, ECONNRESET, ETIMEDOUT, …) → retry with backoff.
  * - `client`: HTTP 4xx except 429 (bad request, auth, not found) → no retry
  *   (a different model may still succeed → caller falls back).
@@ -40,9 +40,8 @@ export function classifyError(err: unknown): ErrorClass {
   if (err instanceof Error && err.name === "AbortError") return "abort"; // native/DOMException
   const msg = err instanceof Error ? err.message : String(err);
   if (msg.includes("returned no content")) return "no_content";
-  const m = /returned (\d{3}):/.exec(msg);
-  if (m) {
-    const status = Number(m[1]);
+  const status = extractHttpStatus(msg);
+  if (status !== undefined) {
     if (status === 429 || status >= 500) return "retryable";
     if (status >= 400 && status < 500) return "client";
   }
@@ -51,6 +50,22 @@ export function classifyError(err: unknown): ErrorClass {
     return "retryable";
   }
   return "client";
+}
+
+/** Recognize both the legacy direct-fetch error and Pi provider-normalized
+ * HTTP errors (for example `OpenAI API error (503): ...`). */
+function extractHttpStatus(message: string): number | undefined {
+  const patterns = [
+    /returned\s+(\d{3})\s*:/i,
+    /API error\s*\((\d{3})\)\s*:/i,
+    /\bHTTP(?: error)?\s+(\d{3})\b/i,
+    /\b(\d{3})\s+status code\b/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(message);
+    if (match) return Number(match[1]);
+  }
+  return undefined;
 }
 
 /**
