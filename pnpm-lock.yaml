@@ -7,10 +7,11 @@ settings:
 importers:
 
   .:
-    devDependencies:
+    dependencies:
       '@earendil-works/pi-ai':
-        specifier: '*'
+        specifier: ^0.80.3
         version: 0.80.3(ws@8.21.0)(zod@4.4.3)
+    devDependencies:
       '@earendil-works/pi-coding-agent':
         specifier: '*'
         version: 0.80.3(ws@8.21.0)(zod@4.4.3)

@@ -80,18 +80,68 @@ export type ResolvedVisionAuth = {
 
 export type VisionProviderTransport = Pick<Provider<Api>, "streamSimple">;
 
+class VisionProviderRequestError extends Error {
+  override readonly name = "VisionProviderRequestError";
+}
+
+function publicProviderFailureMessage(
+  error: unknown,
+  status?: number,
+  knownClass?: ReturnType<typeof classifyError>,
+): string {
+  if (status !== undefined) {
+    return `Vision provider request failed (HTTP ${status}).`;
+  }
+  switch (knownClass ?? classifyError(error)) {
+    case "retryable":
+      return "Vision provider request failed due to a network or server error.";
+    case "no_content":
+      return "Vision provider returned no usable content.";
+    case "abort":
+      return "Vision provider request was aborted.";
+    default:
+      return "Vision provider rejected the request.";
+  }
+}
+
 async function resolveVisionTransport(
   registry: ModelRegistryLike,
   model: Model<Api>,
 ): Promise<VisionProviderTransport | undefined> {
-  if (registry.getProvider) {
-    return registry.getProvider(model.provider);
-  }
+  try {
+    if (registry.getProvider) {
+      return registry.getProvider(model.provider);
+    }
 
-  // Pi < 0.84 exposed only the API registry to extensions. Keep that runtime
-  // compatible without restoring the old hand-written HTTP request path.
-  const { getApiProvider } = await import("@earendil-works/pi-ai/compat");
-  return getApiProvider(model.api);
+    // Pi < 0.84 exposed only an API-global registry, which another extension
+    // could override. Load known built-in adapters by fixed module specifier
+    // instead; unknown/custom APIs fail closed because provider isolation
+    // cannot be proven without ModelRegistry.getProvider().
+    switch (model.api) {
+      case "anthropic-messages":
+        return (await import("@earendil-works/pi-ai/api/anthropic-messages.lazy")).anthropicMessagesApi();
+      case "azure-openai-responses":
+        return (await import("@earendil-works/pi-ai/api/azure-openai-responses.lazy")).azureOpenAIResponsesApi();
+      case "bedrock-converse-stream":
+        return (await import("@earendil-works/pi-ai/api/bedrock-converse-stream.lazy")).bedrockConverseStreamApi();
+      case "google-generative-ai":
+        return (await import("@earendil-works/pi-ai/api/google-generative-ai.lazy")).googleGenerativeAIApi();
+      case "google-vertex":
+        return (await import("@earendil-works/pi-ai/api/google-vertex.lazy")).googleVertexApi();
+      case "mistral-conversations":
+        return (await import("@earendil-works/pi-ai/api/mistral-conversations.lazy")).mistralConversationsApi();
+      case "openai-codex-responses":
+        return (await import("@earendil-works/pi-ai/api/openai-codex-responses.lazy")).openAICodexResponsesApi();
+      case "openai-completions":
+        return (await import("@earendil-works/pi-ai/api/openai-completions.lazy")).openAICompletionsApi();
+      case "openai-responses":
+        return (await import("@earendil-works/pi-ai/api/openai-responses.lazy")).openAIResponsesApi();
+      default:
+        return undefined;
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -133,18 +183,32 @@ export async function callVisionModel(
     maxTokens: 4096,
     ...(visionModel.reasoning && reasoning !== "off" ? { reasoning } : {}),
     onResponse: (response) => {
-      responseStatus = response.status;
+      const status: unknown = response.status;
+      if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) {
+        responseStatus = status;
+      }
     },
   };
-  const response = await transport.streamSimple(requestModel, context, options).result();
+  const response = await (async () => {
+    try {
+      return await transport.streamSimple(requestModel, context, options).result();
+    } catch (error) {
+      const errorClass = classifyError(error);
+      if (errorClass === "abort") {
+        throw new AbortError("Vision model request aborted");
+      }
+      throw new VisionProviderRequestError(
+        publicProviderFailureMessage(error, responseStatus, errorClass),
+      );
+    }
+  })();
 
   if (response.stopReason === "aborted") {
-    throw new AbortError(response.errorMessage ?? "Vision model request aborted");
+    throw new AbortError("Vision model request aborted");
   }
   if (response.stopReason === "error") {
-    const detail = response.errorMessage ?? "Unknown provider error";
-    const status = responseStatus ? ` returned ${responseStatus}:` : " error:";
-    throw new Error(`Vision model${status} ${detail}`);
+    const providerError = new Error(response.errorMessage ?? "Unknown provider error");
+    throw new VisionProviderRequestError(publicProviderFailureMessage(providerError, responseStatus));
   }
 
   const text = response.content
@@ -177,15 +241,16 @@ function formatImageError(error: { code: string; path?: string; message?: string
   }
 }
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+function safeProviderErrorMessage(err: unknown): string {
+  if (err instanceof VisionProviderRequestError) return err.message;
+  return publicProviderFailureMessage(err);
 }
 
 /** Short traceability string for a primary error (used when the fallback
  *  also fails, so the caller can see why the primary was abandoned). */
 function primaryErrorTag(err: unknown): string {
   const cls = classifyError(err);
-  const msg = errorMessage(err).slice(0, 120);
+  const msg = safeProviderErrorMessage(err).slice(0, 120);
   return `${cls}: ${msg}`;
 }
 
@@ -223,6 +288,23 @@ const LOCAL_ONLY_MSG = (cacheHint: string) =>
     "To inspect the cache:",
     "  /vision cache show",
   ].join("\n");
+
+function authFailureMessage(provider: string, fallback = false): string {
+  const label = fallback ? `fallback "${provider}"` : `"${provider}"`;
+  return `Vision tool error: unable to resolve API credentials for ${label}. Check the provider authentication configuration in Pi.`;
+}
+
+async function resolveVisionAuth(
+  registry: ModelRegistryLike,
+  model: Model<Api>,
+): Promise<ResolvedVisionAuth> {
+  try {
+    const auth = await registry.getApiKeyAndHeaders(model);
+    return auth?.ok === true ? auth : { ok: false, error: "Authentication resolution failed" };
+  } catch {
+    return { ok: false, error: "Authentication resolution failed" };
+  }
+}
 
 /** Write one audit entry (best-effort) if audit logging is enabled. */
 function audit(config: VisionConfig, entry: AuditEntry): void {
@@ -276,15 +358,24 @@ export async function delegateToVisionModel(
     };
   }
 
-  const auth = await registry.getApiKeyAndHeaders(visionModel);
-  if (!auth.ok) {
-    return {
-      ok: false,
-      error: {
-        code: "auth_error",
-        message: `Vision tool error: unable to resolve API key for "${config.provider}". ${auth.error}`,
-      },
-    };
+  // Auth resolution can execute OAuth refreshes or configured !commands. Keep
+  // it behind cache/local-only gates whenever those gates can decide the call
+  // without contacting a provider. The no-cache, non-local-only shape keeps
+  // its historical auth-before-image error precedence.
+  const deferAuth = config.localOnly || !!(cache && config.cacheEnabled);
+  let auth: Extract<ResolvedVisionAuth, { ok: true }> | undefined;
+  if (!deferAuth) {
+    const resolvedAuth = await resolveVisionAuth(registry, visionModel);
+    if (!resolvedAuth.ok) {
+      return {
+        ok: false,
+        error: {
+          code: "auth_error",
+          message: authFailureMessage(config.provider!),
+        },
+      };
+    }
+    auth = resolvedAuth;
   }
 
   const loaded = await loadImage(params.image_path, {
@@ -357,13 +448,29 @@ export async function delegateToVisionModel(
   }
 
   // ── Network call (single path) ───────────────────────────────────────
+  if (!auth) {
+    const resolvedAuth = await resolveVisionAuth(registry, visionModel);
+    if (!resolvedAuth.ok) {
+      return {
+        ok: false,
+        error: {
+          code: "auth_error",
+          message: authFailureMessage(config.provider!),
+        },
+      };
+    }
+    auth = resolvedAuth;
+  }
   const transport = await resolveVisionTransport(registry, visionModel);
   if (!transport) {
+    const legacyHint = registry.getProvider
+      ? ""
+      : " Pi <0.84 only supports built-in API transports here; upgrade Pi to use provider-scoped custom transports.";
     return {
       ok: false,
       error: {
         code: "provider_not_found",
-        message: `Vision tool error: provider transport "${visionModel.provider}" was not found in Pi's model registry.`,
+        message: `Vision tool error: provider transport "${visionModel.provider}" was not found in Pi's model registry.${legacyHint}`,
       },
     };
   }
@@ -430,7 +537,7 @@ async function callWithRetryAndFallback(
     if (!config.fallbackProvider || !config.fallbackModel) {
       return {
         ok: false,
-        error: { code: "vision_call_error", message: `Vision tool error: ${errorMessage(err)}` },
+        error: { code: "vision_call_error", message: `Vision tool error: ${safeProviderErrorMessage(err)}` },
       };
     }
     return runFallback(ctx, config, params, signal, image, err);
@@ -456,24 +563,27 @@ async function runFallback(
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
   }
-  const fbAuth = await registry.getApiKeyAndHeaders(fbModel);
+  const fbAuth = await resolveVisionAuth(registry, fbModel);
   if (!fbAuth.ok) {
     return {
       ok: false,
       error: {
         code: "auth_error",
-        message: `Vision tool error: unable to resolve API key for fallback "${config.fallbackProvider}". ${fbAuth.error}`,
+        message: authFailureMessage(config.fallbackProvider!, true),
       },
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
   }
   const fbTransport = await resolveVisionTransport(registry, fbModel);
   if (!fbTransport) {
+    const legacyHint = registry.getProvider
+      ? ""
+      : " Pi <0.84 only supports built-in API transports here; upgrade Pi to use provider-scoped custom transports.";
     return {
       ok: false,
       error: {
         code: "provider_not_found",
-        message: `Vision tool error: fallback provider transport "${fbModel.provider}" was not found in Pi's model registry.`,
+        message: `Vision tool error: fallback provider transport "${fbModel.provider}" was not found in Pi's model registry.${legacyHint}`,
       },
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
@@ -499,7 +609,7 @@ async function runFallback(
     }
     return {
       ok: false,
-      error: { code: "vision_call_error", message: `Vision tool error (fallback ${fallbackId}): ${errorMessage(fbErr)}` },
+      error: { code: "vision_call_error", message: `Vision tool error (fallback ${fallbackId}): ${safeProviderErrorMessage(fbErr)}` },
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
   }

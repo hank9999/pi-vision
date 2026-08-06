@@ -498,7 +498,8 @@ test("T7: auth failure → actionable auth_error", async () => {
       makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL, authOk: false }) }),
     );
     assert.equal(res.isError, true);
-    assert.match(res.content[0].text, /no api key configured/);
+    assert.match(res.content[0].text, /provider authentication configuration in Pi/);
+    assert.doesNotMatch(res.content[0].text, /no api key configured/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

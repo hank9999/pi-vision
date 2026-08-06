@@ -1,6 +1,7 @@
 // delegator.test.mts — verifies createVisionDelegator + the public exports surface.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { isMultimodal, loadConfig, createVisionDelegator } from "../src/index.ts";
 
 // A fake ModelRegistry slice. Transport lookup is unnecessary while the test
@@ -14,6 +15,17 @@ test("isMultimodal + loadConfig + createVisionDelegator are exported", () => {
   assert.equal(typeof isMultimodal, "function");
   assert.equal(typeof loadConfig, "function");
   assert.equal(typeof createVisionDelegator, "function");
+});
+
+test("published package declares pi-ai as a runtime dependency", () => {
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { dependencies?: Record<string, string> };
+  assert.equal(
+    typeof packageJson.dependencies?.["@earendil-works/pi-ai"],
+    "string",
+    "legacy built-in adapter imports must survive npm install --omit=dev",
+  );
 });
 
 test("createVisionDelegator returns a delegator with config + delegate fn", () => {

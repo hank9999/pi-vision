@@ -353,7 +353,10 @@ Three mechanisms combine to guarantee the behavior:
    uses `/responses` + `input_image`; an `openai-completions` model uses
    `/chat/completions` + `image_url`; Anthropic, Gemini, and custom providers
    use their own registered transports. The extension never hardcodes an API
-   protocol or appends `/chat/completions` itself.
+   protocol or appends `/chat/completions` itself. On Pi 0.84 and newer,
+   transport lookup is provider-scoped. Pi versions before 0.84 use fixed Pi
+   built-in adapters only; custom API transports fail closed instead of using
+   the legacy global API registry. Upgrade Pi to use custom providers safely.
 
 ## Using `describe_image`
 

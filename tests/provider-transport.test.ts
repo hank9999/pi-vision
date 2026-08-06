@@ -229,8 +229,10 @@ test("Pi openai-responses 503 remains retryable for vision resilience", async ()
       ),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /503/);
-        assert.match(error.message, /No available providers/);
+        assert.equal(
+          error.message,
+          "Vision provider request failed due to a network or server error.",
+        );
         assert.equal(classifyError(error), "retryable");
         return true;
       },

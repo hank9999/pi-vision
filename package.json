@@ -48,12 +48,14 @@
     "test": "tsx --test",
     "test:run": "tsx --test"
   },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.80.3"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*",
